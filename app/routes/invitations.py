@@ -64,7 +64,8 @@ async def send_invitations(
         invitations = [
             InvitationCreated(
                 invitation_id=UUID(inv["invitation_id"]),
-                invited_user_id=UUID(inv["invited_user_id"]),
+                user_id=UUID(inv["user_id"]),
+                status=inv["status"],
                 invited_at=datetime.fromisoformat(inv["invited_at"]),
                 expires_at=datetime.fromisoformat(inv["expires_at"])
             )
@@ -259,8 +260,8 @@ async def get_sent_invitations(
                 invitation_id=row["invitation_id"],
                 activity_id=row["activity_id"],
                 activity_title=row["activity_title"],
-                invited_user_id=row["invited_user_id"],
-                invited_username=row["invited_username"],
+                user_id=row["user_id"],
+                username=row["username"],
                 status=row["status"],
                 message=row["message"],
                 invited_at=row["invited_at"],

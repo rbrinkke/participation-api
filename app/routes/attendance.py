@@ -61,7 +61,7 @@ async def mark_attendance(
         successful_attendances = [
             AttendanceUpdate(
                 user_id=att.user_id,
-                status=att.status,
+                attendance_status=att.status,
                 updated_at=datetime.now()
             )
             for att in body.attendances
@@ -146,6 +146,7 @@ async def get_pending_verifications(
                 PendingVerificationParticipant(
                     user_id=UUID(p["user_id"]),
                     username=p["username"],
+                    first_name=p.get("first_name"),
                     profile_photo_url=p.get("profile_photo_url")
                 )
                 for p in participants_data

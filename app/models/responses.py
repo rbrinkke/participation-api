@@ -59,17 +59,18 @@ class ListParticipantsResponse(BaseModel):
 class ActivityInfo(BaseModel):
     activity_id: UUID
     title: str
-    description: Optional[str]
-    location: Optional[str]
     scheduled_at: datetime
-    duration: Optional[int]
+    location_name: Optional[str]
+    city: Optional[str]
+    organizer_user_id: UUID
+    organizer_username: str
+    current_participants_count: int
     max_participants: Optional[int]
-    current_participants: int
-    visibility: str
-    access_type: str
-    user_role: Optional[str]
+    activity_type: str
+    role: Optional[str]
     participation_status: str
-    attendance_status: Optional[str]
+    attendance_status: str
+    joined_at: datetime
 
 
 class UserActivitiesResponse(BaseModel):
@@ -96,7 +97,7 @@ class DemoteParticipantResponse(BaseModel):
 
 class AttendanceUpdate(BaseModel):
     user_id: UUID
-    status: str
+    attendance_status: str
     updated_at: datetime
 
 
@@ -120,6 +121,7 @@ class ConfirmAttendanceResponse(BaseModel):
 class PendingVerificationParticipant(BaseModel):
     user_id: UUID
     username: str
+    first_name: Optional[str]
     profile_photo_url: Optional[str]
 
 
@@ -137,7 +139,8 @@ class PendingVerificationsResponse(BaseModel):
 
 class InvitationCreated(BaseModel):
     invitation_id: UUID
-    invited_user_id: UUID
+    user_id: UUID
+    status: str
     invited_at: datetime
     expires_at: datetime
 
@@ -204,8 +207,8 @@ class SentInvitationInfo(BaseModel):
     invitation_id: UUID
     activity_id: UUID
     activity_title: str
-    invited_user_id: UUID
-    invited_username: str
+    user_id: UUID
+    username: str
     status: str
     message: Optional[str]
     invited_at: datetime

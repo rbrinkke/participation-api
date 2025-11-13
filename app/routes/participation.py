@@ -255,17 +255,18 @@ async def get_user_activities(
             ActivityInfo(
                 activity_id=row["activity_id"],
                 title=row["title"],
-                description=row["description"],
-                location=row["location"],
                 scheduled_at=row["scheduled_at"],
-                duration=row["duration"],
+                location_name=row["location_name"],
+                city=row["city"],
+                organizer_user_id=row["organizer_user_id"],
+                organizer_username=row["organizer_username"],
+                current_participants_count=row["current_participants_count"],
                 max_participants=row["max_participants"],
-                current_participants=row["current_participants"],
-                visibility=row["visibility"],
-                access_type=row["access_type"],
-                user_role=row["user_role"],
+                activity_type=row["activity_type"],
+                role=row["role"],
                 participation_status=row["participation_status"],
-                attendance_status=row["attendance_status"]
+                attendance_status=row["attendance_status"],
+                joined_at=row["joined_at"]
             )
             for row in rows
         ]
