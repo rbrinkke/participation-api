@@ -8,6 +8,6 @@ Currently all dependencies are defined in their respective modules (auth, databa
 # Placeholder for future shared dependencies
 # Import and re-export commonly used dependencies here if needed
 from app.auth import get_current_user
-from app.database import db_pool
+from app.database import get_pool
 
-__all__ = ["get_current_user", "db_pool"]
+__all__ = ["get_current_user", "get_pool"]

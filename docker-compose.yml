@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  participation-api:
+    build: .
+    ports:
+      - "8004:8001"
+    environment:
+      - DB_HOST=activity-postgres-db
+      - DB_PORT=5432
+      - DB_NAME=activitydb
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres_secure_password_change_in_prod
+      - JWT_SECRET_KEY=dev-secret-key-change-in-production
+      - JWT_ALGORITHM=HS256
+      - REDIS_HOST=auth-redis
+      - REDIS_PORT=6379
+      - API_HOST=0.0.0.0
+      - API_PORT=8001
+      - ENVIRONMENT=production
+    networks:
+      - activity-network
+    container_name: participation-api
+
+networks:
+  activity-network:
+    external: true

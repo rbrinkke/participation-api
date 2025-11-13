@@ -3,7 +3,7 @@ from uuid import UUID
 from datetime import datetime
 
 from app.auth import get_current_user
-from app.database import db_pool
+from app.database import get_pool
 from app.models.requests import PromoteParticipantRequest, DemoteParticipantRequest
 from app.models.responses import PromoteParticipantResponse, DemoteParticipantResponse
 from app.utils.errors import map_sp_error
@@ -18,12 +18,13 @@ async def promote_participant(
     request: Request,
     activity_id: UUID,
     body: PromoteParticipantRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Promote member to co-organizer (organizer only).
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_promote_participant($1, $2, $3)
@@ -51,12 +52,13 @@ async def demote_participant(
     request: Request,
     activity_id: UUID,
     body: DemoteParticipantRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Demote co-organizer to member (organizer only).
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_demote_participant($1, $2, $3)

@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from app.auth import get_current_user
-from app.database import db_pool
+from app.database import get_pool
 from app.models.requests import CancelParticipationRequest
 from app.models.responses import (
     JoinActivityResponse,
@@ -27,7 +27,8 @@ router = APIRouter(prefix="/api/v1/participation", tags=["participation"])
 async def join_activity(
     request: Request,
     activity_id: UUID,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Join an activity (or join waitlist if full).
@@ -35,7 +36,7 @@ async def join_activity(
     Premium users can skip joinable_at_free period.
     Blocking is enforced (except for XXL activities).
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_join_activity($1, $2, $3)
@@ -74,14 +75,15 @@ async def join_activity(
 async def leave_activity(
     request: Request,
     activity_id: UUID,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Leave an activity.
 
     Organizer cannot leave. Automatically promotes next waitlisted user if any.
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_leave_activity($1, $2)
@@ -116,14 +118,15 @@ async def cancel_participation(
     request: Request,
     activity_id: UUID,
     body: CancelParticipationRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Cancel participation (keeps record but marks as cancelled).
 
     Automatically promotes next waitlisted user if any.
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_cancel_participation($1, $2, $3)
@@ -163,7 +166,8 @@ async def list_participants(
     role: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     List participants of activity (respects blocking).
@@ -174,7 +178,7 @@ async def list_participants(
     - limit: Max results (1-100)
     - offset: Pagination
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT * FROM activity.sp_list_participants($1, $2, $3, $4, $5, $6)
@@ -228,14 +232,15 @@ async def get_user_activities(
     status: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     List user's activities (own or other if allowed).
 
     Respects blocking if viewing other user's activities.
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT * FROM activity.sp_get_user_activities($1, $2, $3, $4, $5, $6)

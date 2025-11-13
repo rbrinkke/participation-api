@@ -1,6 +1,8 @@
 import asyncpg
+import logging
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # Global pool instance
@@ -24,7 +26,13 @@ async def get_db_pool():
 async def init_db():
     """Initialize database pool on startup"""
     global db_pool
-    db_pool = await get_db_pool()
+    logger.info("=== INITIALIZING DATABASE POOL ===")
+    try:
+        db_pool = await get_db_pool()
+        logger.info(f"=== DATABASE POOL INITIALIZED: {db_pool} ===")
+    except Exception as e:
+        logger.error(f"=== DATABASE POOL INITIALIZATION FAILED: {e} ===")
+        raise
 
 
 async def close_db():
@@ -32,3 +40,11 @@ async def close_db():
     global db_pool
     if db_pool:
         await db_pool.close()
+
+
+def get_pool():
+    """Get database pool for dependency injection"""
+    global db_pool
+    if db_pool is None:
+        raise RuntimeError("Database pool not initialized")
+    return db_pool

@@ -1,8 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import logging
 
 from app.database import init_db, close_db
+
+logger = logging.getLogger(__name__)
 from app.routes import (
     health,
     participation,
@@ -19,10 +22,14 @@ from slowapi.errors import RateLimitExceeded
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
     # Startup
+    logger.info("=== LIFESPAN STARTUP BEGIN ===")
     await init_db()
+    logger.info("=== LIFESPAN STARTUP COMPLETE ===")
     yield
     # Shutdown
+    logger.info("=== LIFESPAN SHUTDOWN BEGIN ===")
     await close_db()
+    logger.info("=== LIFESPAN SHUTDOWN COMPLETE ===")
 
 
 app = FastAPI(

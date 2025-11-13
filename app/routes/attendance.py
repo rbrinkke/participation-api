@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 
 from app.auth import get_current_user
-from app.database import db_pool
+from app.database import get_pool
 from app.models.requests import MarkAttendanceRequest, ConfirmAttendanceRequest
 from app.models.responses import (
     MarkAttendanceResponse,
@@ -26,7 +26,8 @@ async def mark_attendance(
     request: Request,
     activity_id: UUID,
     body: MarkAttendanceRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Mark attendance for participants (organizer/co-organizer only).
@@ -40,7 +41,7 @@ async def mark_attendance(
         for att in body.attendances
     ])
 
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_mark_attendance($1, $2, $3::jsonb)
@@ -81,7 +82,8 @@ async def mark_attendance(
 async def confirm_attendance(
     request: Request,
     body: ConfirmAttendanceRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Confirm other participant's attendance (peer verification).
@@ -89,7 +91,7 @@ async def confirm_attendance(
     Both users must have attendance_status='attended'.
     Increments verified user's verification_count.
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_confirm_attendance($1, $2, $3)
@@ -119,14 +121,15 @@ async def get_pending_verifications(
     request: Request,
     limit: int = 20,
     offset: int = 0,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     List activities where user attended but hasn't confirmed all participants.
 
     Returns activities with list of unconfirmed participants.
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT * FROM activity.sp_get_pending_verifications($1, $2, $3)

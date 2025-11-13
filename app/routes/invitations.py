@@ -5,7 +5,7 @@ from typing import Optional
 import json
 
 from app.auth import get_current_user
-from app.database import db_pool
+from app.database import get_pool
 from app.models.requests import SendInvitationsRequest
 from app.models.responses import (
     SendInvitationsResponse,
@@ -31,7 +31,8 @@ async def send_invitations(
     request: Request,
     activity_id: UUID,
     body: SendInvitationsRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Send invitations to users (organizer/co-organizer only).
@@ -42,7 +43,7 @@ async def send_invitations(
     # Convert user_ids to PostgreSQL UUID array
     user_ids_array = [str(uid) for uid in body.user_ids]
 
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_send_invitations($1, $2, $3::uuid[], $4, $5)
@@ -95,14 +96,15 @@ async def send_invitations(
 async def accept_invitation(
     request: Request,
     invitation_id: UUID,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Accept invitation and join activity.
 
     May result in registered or waitlisted status.
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_accept_invitation($1, $2)
@@ -130,10 +132,11 @@ async def accept_invitation(
 async def decline_invitation(
     request: Request,
     invitation_id: UUID,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """Decline invitation"""
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_decline_invitation($1, $2)
@@ -159,12 +162,13 @@ async def decline_invitation(
 async def cancel_invitation(
     request: Request,
     invitation_id: UUID,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """
     Cancel invitation (sender only).
     """
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         result = await conn.fetchrow(
             """
             SELECT * FROM activity.sp_cancel_invitation($1, $2)
@@ -191,10 +195,11 @@ async def get_received_invitations(
     status: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """List invitations received by current user"""
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT * FROM activity.sp_get_received_invitations($1, $2, $3, $4)
@@ -238,10 +243,11 @@ async def get_sent_invitations(
     status: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    pool = Depends(get_pool)
 ):
     """List invitations sent by current user"""
-    async with db_pool.acquire() as conn:
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT * FROM activity.sp_get_sent_invitations($1, $2, $3, $4, $5)
