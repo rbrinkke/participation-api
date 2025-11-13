@@ -1,0 +1,2009 @@
+# PARTICIPATION API - SPECIFICATIES VOOR AI CODE AGENT
+
+## 🎯 DOEL VAN DEZE API
+Deze API beheert alle participant-gerelateerde operaties voor activities: join/leave, waitlist management, role management, attendance tracking, peer verification, en invitations. De API fungeert als de complete orchestrator tussen users en activities.
+
+---
+
+## 🏗️ ARCHITECTUUR PRINCIPES
+
+### Database Interactie
+- **ALLEEN stored procedures**: API mag NOOIT direct queries uitvoeren
+- Elke endpoint roept exact 1 stored procedure aan
+- Stored procedures handelen alle business logic af
+- API is thin layer: validatie → SP call → response formatting
+
+### Authenticatie & Autorisatie
+- Alle endpoints vereisen JWT access token (behalve health check)
+- Token bevat: `user_id`, `email`, `subscription_level`, `ghost_mode`, `org_id`
+- `subscription_level` bepaalt Premium features (priority join, etc.)
+- `ghost_mode` voorkomt profile_view tracking (niet relevant voor deze API)
+
+### Error Handling Strategie
+```
+Database errors → catch → log → return user-friendly message
+Validation errors → FastAPI automatic validation → 422 response
+Auth errors → 401 Unauthorized
+Permission errors → 403 Forbidden
+Not found errors → 404 Not Found
+Business logic errors → 400 Bad Request with specific message
+Rate limit errors → 429 Too Many Requests
+```
+
+---
+
+## 📋 ENDPOINTS OVERZICHT
+
+```
+GET    /api/v1/participation/health                    # Health check
+POST   /api/v1/participation/activities/{activity_id}/join          # Join activity
+DELETE /api/v1/participation/activities/{activity_id}/leave         # Leave activity
+POST   /api/v1/participation/activities/{activity_id}/cancel        # Cancel participation
+GET    /api/v1/participation/activities/{activity_id}/participants  # List participants
+POST   /api/v1/participation/activities/{activity_id}/promote       # Promote to co-organizer
+POST   /api/v1/participation/activities/{activity_id}/demote        # Demote from co-organizer
+GET    /api/v1/participation/users/{user_id}/activities            # User's activities
+POST   /api/v1/participation/activities/{activity_id}/attendance    # Mark attendance
+POST   /api/v1/participation/attendance/confirm                     # Peer verification
+GET    /api/v1/participation/attendance/pending                     # Pending verifications
+POST   /api/v1/participation/activities/{activity_id}/invitations   # Send invitation(s)
+POST   /api/v1/participation/invitations/{invitation_id}/accept     # Accept invitation
+POST   /api/v1/participation/invitations/{invitation_id}/decline    # Decline invitation
+DELETE /api/v1/participation/invitations/{invitation_id}            # Cancel invitation
+GET    /api/v1/participation/invitations/received                   # My invitations
+GET    /api/v1/participation/invitations/sent                       # Sent invitations
+GET    /api/v1/participation/activities/{activity_id}/waitlist      # View waitlist
+```
+
+---
+
+## 🔧 ENDPOINT SPECIFICATIES
+
+### 1. Health Check
+
+```
+GET /api/v1/participation/health
+```
+
+**Doel**: Service health monitoring
+
+**Auth**: Geen vereist
+
+**Parameters**: Geen
+
+**Response** (200 OK):
+```json
+{
+  "status": "healthy",
+  "service": "participation-api",
+  "version": "1.0.0",
+  "timestamp": "2025-11-13T10:30:00Z"
+}
+```
+
+**Stored Procedure**: Geen
+
+**Error Handling**: Geen errors mogelijk
+
+---
+
+### 2. Join Activity
+
+```
+POST /api/v1/participation/activities/{activity_id}/join
+```
+
+**Doel**: Gebruiker join een activity (of gaat op waitlist als vol)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity om te joinen
+
+**Request Body**: Leeg (geen body)
+
+**Response** (200 OK - Direct joined):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "role": "member",
+  "participation_status": "registered",
+  "joined_at": "2025-11-13T10:30:00Z",
+  "message": "Successfully joined activity"
+}
+```
+
+**Response** (200 OK - Waitlisted):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "participation_status": "waitlisted",
+  "waitlist_position": 3,
+  "joined_at": "2025-11-13T10:30:00Z",
+  "message": "Activity is full. You have been added to the waitlist at position 3."
+}
+```
+
+**Stored Procedure**: `activity.sp_join_activity`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_join_activity(
+    p_activity_id UUID,
+    p_user_id UUID,
+    p_subscription_level activity.subscription_level
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    participation_status activity.participation_status,
+    waitlist_position INT,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat en status = 'published'
+   - User bestaat en is_active = TRUE
+   - User is niet gebanned (status != 'banned')
+   - Activity is niet vol OF user is Premium (priority join)
+   - Activity scheduled_at > NOW() (niet in verleden)
+   - User is niet organizer van deze activity
+   - User heeft deze activity niet al gejoined/waitlisted
+
+2. **Blocking check** (KRITISCH):
+   - Query: `SELECT 1 FROM activity.user_blocks WHERE (blocker_user_id = p_user_id AND blocked_user_id = organizer_id) OR (blocker_user_id = organizer_id AND blocked_user_id = p_user_id)`
+   - IF block exists AND activity_type != 'xxl' → error 'BLOCKED_USER'
+   - XXL activities: blocking wordt GENEGEERD
+
+3. **Privacy check**:
+   - IF activity_privacy_level = 'friends_only':
+     - Check friendship: `SELECT 1 FROM activity.friendships WHERE (user_id_1 = p_user_id AND user_id_2 = organizer_id OR vice versa) AND status = 'accepted'`
+     - IF no friendship → error 'FRIENDS_ONLY'
+   - IF activity_privacy_level = 'invite_only':
+     - Check invitation: `SELECT 1 FROM activity.activity_invitations WHERE activity_id = p_activity_id AND user_id = p_user_id AND status = 'pending'`
+     - IF no invitation → error 'INVITE_ONLY'
+
+4. **Premium priority check**:
+   - IF joinable_at_free IS NOT NULL AND p_subscription_level = 'free':
+     - IF NOW() < joinable_at_free → error 'PREMIUM_ONLY_PERIOD'
+
+5. **Capacity check**:
+   - IF current_participants_count >= max_participants:
+     - Add to waitlist: INSERT INTO activity.waitlist_entries (activity_id, user_id, position)
+     - position = (SELECT MAX(position) + 1 FROM activity.waitlist_entries WHERE activity_id = p_activity_id)
+     - UPDATE activities SET waitlist_count = waitlist_count + 1
+     - RETURN success=TRUE, participation_status='waitlisted', waitlist_position=position
+   - ELSE:
+     - Add as participant: INSERT INTO activity.participants (activity_id, user_id, role='member', participation_status='registered')
+     - UPDATE activities SET current_participants_count = current_participants_count + 1
+     - IF invite_only: UPDATE activity.activity_invitations SET status = 'accepted', responded_at = NOW()
+     - RETURN success=TRUE, participation_status='registered', waitlist_position=NULL
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `ACTIVITY_NOT_PUBLISHED`: Activity is niet gepubliceerd
+- `ACTIVITY_IN_PAST`: Activity is al geweest
+- `USER_NOT_FOUND`: User niet gevonden
+- `USER_BANNED`: User is gebanned
+- `USER_IS_ORGANIZER`: User is organizer (kan niet joinen)
+- `ALREADY_JOINED`: User heeft al gejoined
+- `BLOCKED_USER`: User is geblokkeerd door organizer (of vice versa)
+- `FRIENDS_ONLY`: Activity is friends only
+- `INVITE_ONLY`: Activity is invite only
+- `PREMIUM_ONLY_PERIOD`: Premium users only (tijdens priority period)
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'USER_NOT_FOUND': (404, 'User not found'),
+        'ALREADY_JOINED': (400, 'Already joined this activity'),
+        'BLOCKED_USER': (403, 'Cannot join this activity'),
+        'FRIENDS_ONLY': (403, 'Activity is friends only'),
+        'INVITE_ONLY': (403, 'Activity is invite only'),
+        'PREMIUM_ONLY_PERIOD': (403, 'Activity is currently only open to Premium members'),
+        'USER_BANNED': (403, 'Account is banned'),
+        'ACTIVITY_IN_PAST': (400, 'Cannot join past activities'),
+        'ACTIVITY_NOT_PUBLISHED': (400, 'Activity is not published'),
+        'USER_IS_ORGANIZER': (400, 'Organizer cannot join own activity')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 3. Leave Activity
+
+```
+DELETE /api/v1/participation/activities/{activity_id}/leave
+```
+
+**Doel**: Gebruiker verlaat een activity (of verlaat waitlist)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity om te verlaten
+
+**Request Body**: Leeg
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "left_at": "2025-11-13T10:30:00Z",
+  "waitlist_promoted": {
+    "user_id": "770e8400-e29b-41d4-a716-446655440000",
+    "promoted_at": "2025-11-13T10:30:00Z"
+  },
+  "message": "Successfully left activity"
+}
+```
+
+**Stored Procedure**: `activity.sp_leave_activity`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_leave_activity(
+    p_activity_id UUID,
+    p_user_id UUID
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    was_participant BOOLEAN,
+    was_waitlisted BOOLEAN,
+    promoted_user_id UUID,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat
+   - Activity scheduled_at > NOW() (kan niet leaven na activity)
+   - User is niet de organizer (organizers kunnen niet leaven)
+
+2. **Check participation type**:
+   - Query participants: `SELECT participation_status FROM activity.participants WHERE activity_id = p_activity_id AND user_id = p_user_id`
+   - Query waitlist: `SELECT position FROM activity.waitlist_entries WHERE activity_id = p_activity_id AND user_id = p_user_id`
+
+3. **IF was participant** (participation_status = 'registered'):
+   - DELETE FROM activity.participants WHERE activity_id = p_activity_id AND user_id = p_user_id
+   - UPDATE activities SET current_participants_count = current_participants_count - 1
+   - **Waitlist promotion logic**:
+     - Get next in line: `SELECT user_id, waitlist_id FROM activity.waitlist_entries WHERE activity_id = p_activity_id ORDER BY position ASC LIMIT 1`
+     - IF exists:
+       - INSERT INTO activity.participants (activity_id, user_id, role='member', participation_status='registered')
+       - DELETE FROM activity.waitlist_entries WHERE waitlist_id = next_waitlist_id
+       - UPDATE activities SET waitlist_count = waitlist_count - 1, current_participants_count = current_participants_count + 1
+       - UPDATE waitlist positions: `UPDATE activity.waitlist_entries SET position = position - 1 WHERE activity_id = p_activity_id`
+       - RETURN success=TRUE, was_participant=TRUE, promoted_user_id=next_user_id
+   - RETURN success=TRUE, was_participant=TRUE, promoted_user_id=NULL
+
+4. **IF was waitlisted**:
+   - DELETE FROM activity.waitlist_entries WHERE activity_id = p_activity_id AND user_id = p_user_id
+   - UPDATE activities SET waitlist_count = waitlist_count - 1
+   - UPDATE positions: `UPDATE activity.waitlist_entries SET position = position - 1 WHERE activity_id = p_activity_id AND position > old_position`
+   - RETURN success=TRUE, was_waitlisted=TRUE
+
+5. **IF not participant or waitlisted**:
+   - RETURN success=FALSE, error_code='NOT_PARTICIPANT'
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `NOT_PARTICIPANT`: User is geen participant of waitlist
+- `IS_ORGANIZER`: Organizer kan niet leaven
+- `ACTIVITY_IN_PAST`: Kan niet leaven na activity
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'NOT_PARTICIPANT': (400, 'Not a participant of this activity'),
+        'IS_ORGANIZER': (403, 'Organizer cannot leave activity'),
+        'ACTIVITY_IN_PAST': (400, 'Cannot leave past activities')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 4. Cancel Participation
+
+```
+POST /api/v1/participation/activities/{activity_id}/cancel
+```
+
+**Doel**: Participant markeert zichzelf als 'cancelled' (blijft in tabel maar status verandert)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity ID
+
+**Request Body**:
+```json
+{
+  "reason": "Can't make it anymore due to unexpected meeting"  // Optional
+}
+```
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "participation_status": "cancelled",
+  "left_at": "2025-11-13T10:30:00Z",
+  "waitlist_promoted": {
+    "user_id": "770e8400-e29b-41d4-a716-446655440000",
+    "promoted_at": "2025-11-13T10:30:00Z"
+  },
+  "message": "Participation cancelled successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_cancel_participation`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_cancel_participation(
+    p_activity_id UUID,
+    p_user_id UUID,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    promoted_user_id UUID,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat
+   - User is participant met status 'registered'
+   - Activity scheduled_at > NOW() (kan niet cancelen na activity)
+
+2. **Update participation**:
+   - UPDATE activity.participants SET participation_status = 'cancelled', left_at = NOW()
+   - IF p_reason IS NOT NULL: UPDATE payload = jsonb_set(payload, '{cancel_reason}', to_jsonb(p_reason))
+   - UPDATE activities SET current_participants_count = current_participants_count - 1
+
+3. **Waitlist promotion logic** (identiek aan leave activity):
+   - Get next in line: `SELECT user_id, waitlist_id FROM activity.waitlist_entries WHERE activity_id = p_activity_id ORDER BY position ASC LIMIT 1`
+   - IF exists:
+     - INSERT INTO activity.participants
+     - DELETE FROM activity.waitlist_entries
+     - UPDATE counts
+     - UPDATE positions
+     - RETURN success=TRUE, promoted_user_id=next_user_id
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `NOT_PARTICIPANT`: User is geen participant
+- `ALREADY_CANCELLED`: Participation al gecancelled
+- `ACTIVITY_IN_PAST`: Kan niet cancelen na activity
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'NOT_PARTICIPANT': (400, 'Not a participant of this activity'),
+        'ALREADY_CANCELLED': (400, 'Participation already cancelled'),
+        'ACTIVITY_IN_PAST': (400, 'Cannot cancel past activities')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 5. List Participants
+
+```
+GET /api/v1/participation/activities/{activity_id}/participants
+```
+
+**Doel**: Lijst van alle participants van een activity (respects blocking)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity ID
+
+**Query Parameters**:
+- `status` (enum, optional): Filter by participation_status ('registered', 'cancelled', 'declined')
+- `role` (enum, optional): Filter by role ('organizer', 'co_organizer', 'member')
+- `limit` (int, optional, default=50): Max results (1-100)
+- `offset` (int, optional, default=0): Pagination offset
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "total_count": 15,
+  "participants": [
+    {
+      "user_id": "660e8400-e29b-41d4-a716-446655440000",
+      "username": "john_doe",
+      "first_name": "John",
+      "last_name": "Doe",
+      "profile_photo_url": "https://...",
+      "role": "organizer",
+      "participation_status": "registered",
+      "attendance_status": "registered",
+      "joined_at": "2025-11-10T14:20:00Z",
+      "is_verified": true,
+      "verification_count": 12
+    },
+    {
+      "user_id": "770e8400-e29b-41d4-a716-446655440000",
+      "username": "jane_smith",
+      "first_name": "Jane",
+      "last_name": "Smith",
+      "profile_photo_url": "https://...",
+      "role": "co_organizer",
+      "participation_status": "registered",
+      "attendance_status": "registered",
+      "joined_at": "2025-11-11T09:15:00Z",
+      "is_verified": true,
+      "verification_count": 8
+    }
+  ]
+}
+```
+
+**Stored Procedure**: `activity.sp_list_participants`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_list_participants(
+    p_activity_id UUID,
+    p_requesting_user_id UUID,
+    p_status activity.participation_status DEFAULT NULL,
+    p_role activity.participant_role DEFAULT NULL,
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+    user_id UUID,
+    username VARCHAR(100),
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    profile_photo_url VARCHAR(500),
+    role activity.participant_role,
+    participation_status activity.participation_status,
+    attendance_status activity.attendance_status,
+    joined_at TIMESTAMP WITH TIME ZONE,
+    is_verified BOOLEAN,
+    verification_count INT,
+    total_count BIGINT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat
+   - Requesting user heeft toegang tot activity (niet geblokkeerd, privacy checks)
+
+2. **Query participants**:
+```sql
+SELECT 
+    u.user_id,
+    u.username,
+    u.first_name,
+    u.last_name,
+    u.main_photo_url AS profile_photo_url,
+    p.role,
+    p.participation_status,
+    p.attendance_status,
+    p.joined_at,
+    u.is_verified,
+    u.verification_count,
+    COUNT(*) OVER() AS total_count
+FROM activity.participants p
+JOIN activity.users u ON p.user_id = u.user_id
+WHERE p.activity_id = p_activity_id
+    -- Blocking check: hide blocked users
+    AND NOT EXISTS (
+        SELECT 1 FROM activity.user_blocks 
+        WHERE (blocker_user_id = p_requesting_user_id AND blocked_user_id = p.user_id)
+           OR (blocker_user_id = p.user_id AND blocked_user_id = p_requesting_user_id)
+    )
+    -- Optional filters
+    AND (p_status IS NULL OR p.participation_status = p_status)
+    AND (p_role IS NULL OR p.role = p_role)
+ORDER BY 
+    CASE p.role 
+        WHEN 'organizer' THEN 1
+        WHEN 'co_organizer' THEN 2
+        ELSE 3
+    END,
+    p.joined_at ASC
+LIMIT p_limit OFFSET p_offset;
+```
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `ACCESS_DENIED`: Geen toegang tot activity
+
+**FastAPI Error Mapping**:
+```python
+if error:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'ACCESS_DENIED': (403, 'Access denied')
+    }
+    status_code, message = error_map.get(error_code, (400, error_message))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 6. Promote to Co-Organizer
+
+```
+POST /api/v1/participation/activities/{activity_id}/promote
+```
+
+**Doel**: Organizer promoot een member naar co-organizer
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity ID
+
+**Request Body**:
+```json
+{
+  "user_id": "770e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "770e8400-e29b-41d4-a716-446655440000",
+  "role": "co_organizer",
+  "promoted_at": "2025-11-13T10:30:00Z",
+  "message": "User promoted to co-organizer successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_promote_participant`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_promote_participant(
+    p_activity_id UUID,
+    p_organizer_user_id UUID,
+    p_target_user_id UUID
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat
+   - Requesting user is organizer van deze activity
+   - Target user is participant met role 'member'
+   - Target user participation_status = 'registered'
+
+2. **Promote**:
+   - UPDATE activity.participants SET role = 'co_organizer' WHERE activity_id = p_activity_id AND user_id = p_target_user_id
+   - RETURN success=TRUE
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `NOT_ORGANIZER`: Requesting user is niet organizer
+- `TARGET_NOT_MEMBER`: Target user is geen member of niet registered
+- `ALREADY_CO_ORGANIZER`: Target user is al co-organizer
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'NOT_ORGANIZER': (403, 'Only organizer can promote participants'),
+        'TARGET_NOT_MEMBER': (400, 'User is not a member participant'),
+        'ALREADY_CO_ORGANIZER': (400, 'User is already a co-organizer')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 7. Demote from Co-Organizer
+
+```
+POST /api/v1/participation/activities/{activity_id}/demote
+```
+
+**Doel**: Organizer demoot een co-organizer naar member
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity ID
+
+**Request Body**:
+```json
+{
+  "user_id": "770e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "770e8400-e29b-41d4-a716-446655440000",
+  "role": "member",
+  "demoted_at": "2025-11-13T10:30:00Z",
+  "message": "User demoted to member successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_demote_participant`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_demote_participant(
+    p_activity_id UUID,
+    p_organizer_user_id UUID,
+    p_target_user_id UUID
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat
+   - Requesting user is organizer van deze activity
+   - Target user is participant met role 'co_organizer'
+
+2. **Demote**:
+   - UPDATE activity.participants SET role = 'member' WHERE activity_id = p_activity_id AND user_id = p_target_user_id
+   - RETURN success=TRUE
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `NOT_ORGANIZER`: Requesting user is niet organizer
+- `NOT_CO_ORGANIZER`: Target user is geen co-organizer
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'NOT_ORGANIZER': (403, 'Only organizer can demote participants'),
+        'NOT_CO_ORGANIZER': (400, 'User is not a co-organizer')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 8. User's Activities
+
+```
+GET /api/v1/participation/users/{user_id}/activities
+```
+
+**Doel**: Lijst alle activities van een user (own profile of other if allowed)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `user_id` (UUID, required): User ID (kan eigen user_id zijn of andere user)
+
+**Query Parameters**:
+- `type` (enum, optional): Filter by type ('upcoming', 'past', 'organized', 'attended')
+- `status` (enum, optional): Filter by participation_status ('registered', 'cancelled', 'declined', 'waitlisted')
+- `limit` (int, optional, default=20): Max results (1-100)
+- `offset` (int, optional, default=0): Pagination offset
+
+**Response** (200 OK):
+```json
+{
+  "user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "total_count": 25,
+  "activities": [
+    {
+      "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+      "title": "Weekend Hiking Trip",
+      "scheduled_at": "2025-11-20T09:00:00Z",
+      "location_name": "Blue Ridge Mountains",
+      "city": "Asheville",
+      "organizer_user_id": "770e8400-e29b-41d4-a716-446655440000",
+      "organizer_username": "outdoor_enthusiast",
+      "current_participants_count": 8,
+      "max_participants": 12,
+      "activity_type": "standard",
+      "role": "member",
+      "participation_status": "registered",
+      "attendance_status": "registered",
+      "joined_at": "2025-11-12T14:20:00Z"
+    }
+  ]
+}
+```
+
+**Stored Procedure**: `activity.sp_get_user_activities`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_get_user_activities(
+    p_target_user_id UUID,
+    p_requesting_user_id UUID,
+    p_type VARCHAR(20) DEFAULT NULL,  -- 'upcoming', 'past', 'organized', 'attended'
+    p_status activity.participation_status DEFAULT NULL,
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+    activity_id UUID,
+    title VARCHAR(255),
+    scheduled_at TIMESTAMP WITH TIME ZONE,
+    location_name VARCHAR(255),
+    city VARCHAR(100),
+    organizer_user_id UUID,
+    organizer_username VARCHAR(100),
+    current_participants_count INT,
+    max_participants INT,
+    activity_type activity.activity_type,
+    role activity.participant_role,
+    participation_status activity.participation_status,
+    attendance_status activity.attendance_status,
+    joined_at TIMESTAMP WITH TIME ZONE,
+    total_count BIGINT
+)
+```
+
+**SP Logic**:
+1. **Privacy check**:
+   - IF p_requesting_user_id != p_target_user_id:
+     - Check blocking: `SELECT 1 FROM activity.user_blocks WHERE (blocker_user_id = p_requesting_user_id AND blocked_user_id = p_target_user_id) OR vice versa`
+     - IF blocked: RETURN empty result set
+
+2. **Query activities**:
+```sql
+SELECT 
+    a.activity_id,
+    a.title,
+    a.scheduled_at,
+    a.location_name,
+    a.city,
+    a.organizer_user_id,
+    u.username AS organizer_username,
+    a.current_participants_count,
+    a.max_participants,
+    a.activity_type,
+    p.role,
+    p.participation_status,
+    p.attendance_status,
+    p.joined_at,
+    COUNT(*) OVER() AS total_count
+FROM activity.participants p
+JOIN activity.activities a ON p.activity_id = a.activity_id
+JOIN activity.users u ON a.organizer_user_id = u.user_id
+WHERE p.user_id = p_target_user_id
+    AND a.status != 'draft'  -- Hide drafts
+    -- Type filters
+    AND (p_type IS NULL 
+        OR (p_type = 'upcoming' AND a.scheduled_at > NOW())
+        OR (p_type = 'past' AND a.scheduled_at <= NOW())
+        OR (p_type = 'organized' AND a.organizer_user_id = p_target_user_id)
+        OR (p_type = 'attended' AND p.attendance_status = 'attended')
+    )
+    -- Status filter
+    AND (p_status IS NULL OR p.participation_status = p_status)
+ORDER BY a.scheduled_at DESC
+LIMIT p_limit OFFSET p_offset;
+```
+
+**Error Codes**:
+- `USER_NOT_FOUND`: User niet gevonden
+- `ACCESS_DENIED`: Geblokkeerd of geen toegang
+
+**FastAPI Error Mapping**:
+```python
+if error:
+    error_map = {
+        'USER_NOT_FOUND': (404, 'User not found'),
+        'ACCESS_DENIED': (403, 'Access denied')
+    }
+    status_code, message = error_map.get(error_code, (400, error_message))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 9. Mark Attendance
+
+```
+POST /api/v1/participation/activities/{activity_id}/attendance
+```
+
+**Doel**: Mark attendance voor participants na activity (organizer/co-organizer only)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity ID
+
+**Request Body**:
+```json
+{
+  "attendances": [
+    {
+      "user_id": "770e8400-e29b-41d4-a716-446655440000",
+      "status": "attended"
+    },
+    {
+      "user_id": "880e8400-e29b-41d4-a716-446655440000",
+      "status": "no_show"
+    }
+  ]
+}
+```
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "updated_count": 2,
+  "attendances": [
+    {
+      "user_id": "770e8400-e29b-41d4-a716-446655440000",
+      "attendance_status": "attended",
+      "updated_at": "2025-11-13T10:30:00Z"
+    },
+    {
+      "user_id": "880e8400-e29b-41d4-a716-446655440000",
+      "attendance_status": "no_show",
+      "updated_at": "2025-11-13T10:30:00Z"
+    }
+  ],
+  "message": "Attendance updated successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_mark_attendance`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mark_attendance(
+    p_activity_id UUID,
+    p_marking_user_id UUID,
+    p_attendances JSONB  -- [{"user_id": "...", "status": "attended"}]
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    updated_count INT,
+    failed_updates JSONB,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat
+   - Activity scheduled_at <= NOW() (moet afgelopen zijn)
+   - Marking user is organizer OF co_organizer
+   - Max 100 attendances per call
+
+2. **Loop through attendances**:
+   - Voor elke attendance in p_attendances:
+     - Valideer user_id is participant met status 'registered'
+     - UPDATE activity.participants SET attendance_status = p_status WHERE activity_id = p_activity_id AND user_id = p_user_id
+     - IF status = 'no_show': UPDATE activity.users SET no_show_count = no_show_count + 1 WHERE user_id = p_user_id
+     - Track successes en failures
+
+3. **Return results**:
+   - RETURN success=TRUE, updated_count=count, failed_updates=json_array_of_failures
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `NOT_AUTHORIZED`: Marking user is niet organizer/co-organizer
+- `ACTIVITY_NOT_COMPLETED`: Activity is nog niet afgelopen
+- `TOO_MANY_UPDATES`: Meer dan 100 attendances in één call
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'NOT_AUTHORIZED': (403, 'Only organizer or co-organizer can mark attendance'),
+        'ACTIVITY_NOT_COMPLETED': (400, 'Activity has not yet completed'),
+        'TOO_MANY_UPDATES': (400, 'Maximum 100 attendances per request')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 10. Peer Verification (Confirm Attendance)
+
+```
+POST /api/v1/participation/attendance/confirm
+```
+
+**Doel**: Participant bevestigt aanwezigheid van andere participant (peer verification)
+
+**Auth**: Access token required
+
+**Request Body**:
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "confirmed_user_id": "770e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response** (200 OK):
+```json
+{
+  "confirmation_id": "990e8400-e29b-41d4-a716-446655440000",
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "confirmed_user_id": "770e8400-e29b-41d4-a716-446655440000",
+  "confirmer_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "created_at": "2025-11-13T10:30:00Z",
+  "verification_count_updated": 13,
+  "message": "Attendance confirmed successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_confirm_attendance`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_confirm_attendance(
+    p_activity_id UUID,
+    p_confirmed_user_id UUID,
+    p_confirmer_user_id UUID
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    confirmation_id UUID,
+    new_verification_count INT,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat en scheduled_at <= NOW()
+   - Both users zijn participants met attendance_status = 'attended'
+   - Confirmer != confirmed (niet jezelf bevestigen)
+   - Confirmation bestaat nog niet (UNIQUE constraint check)
+
+2. **Insert confirmation**:
+   - INSERT INTO activity.attendance_confirmations (activity_id, confirmed_user_id, confirmer_user_id) VALUES (...)
+   - UPDATE activity.users SET verification_count = verification_count + 1 WHERE user_id = p_confirmed_user_id
+   - Get new verification_count
+   - RETURN success=TRUE, confirmation_id=new_id, new_verification_count=count
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `ACTIVITY_NOT_COMPLETED`: Activity is nog niet afgelopen
+- `CONFIRMER_NOT_ATTENDED`: Confirmer heeft status 'attended' niet
+- `CONFIRMED_NOT_ATTENDED`: Confirmed user heeft status 'attended' niet
+- `SELF_CONFIRMATION`: Kan jezelf niet bevestigen
+- `ALREADY_CONFIRMED`: Confirmation bestaat al
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'ACTIVITY_NOT_COMPLETED': (400, 'Activity has not yet completed'),
+        'CONFIRMER_NOT_ATTENDED': (400, 'You must have attended status to confirm others'),
+        'CONFIRMED_NOT_ATTENDED': (400, 'User does not have attended status'),
+        'SELF_CONFIRMATION': (400, 'Cannot confirm your own attendance'),
+        'ALREADY_CONFIRMED': (400, 'You already confirmed this user for this activity')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 11. Pending Verifications
+
+```
+GET /api/v1/participation/attendance/pending
+```
+
+**Doel**: Lijst van activities waar user aanwezig was maar nog niet verified
+
+**Auth**: Access token required
+
+**Query Parameters**:
+- `limit` (int, optional, default=20): Max results (1-50)
+- `offset` (int, optional, default=0): Pagination offset
+
+**Response** (200 OK):
+```json
+{
+  "total_count": 3,
+  "pending_verifications": [
+    {
+      "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+      "title": "Weekend Hiking Trip",
+      "scheduled_at": "2025-11-12T09:00:00Z",
+      "participants_to_confirm": [
+        {
+          "user_id": "770e8400-e29b-41d4-a716-446655440000",
+          "username": "jane_smith",
+          "first_name": "Jane",
+          "profile_photo_url": "https://..."
+        },
+        {
+          "user_id": "880e8400-e29b-41d4-a716-446655440000",
+          "username": "bob_jones",
+          "first_name": "Bob",
+          "profile_photo_url": "https://..."
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Stored Procedure**: `activity.sp_get_pending_verifications`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_get_pending_verifications(
+    p_user_id UUID,
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+    activity_id UUID,
+    title VARCHAR(255),
+    scheduled_at TIMESTAMP WITH TIME ZONE,
+    participants_to_confirm JSONB,  -- Array of user objects
+    total_count BIGINT
+)
+```
+
+**SP Logic**:
+1. **Query activities waar user attended was**:
+```sql
+WITH user_attended_activities AS (
+    SELECT a.activity_id, a.title, a.scheduled_at
+    FROM activity.participants p
+    JOIN activity.activities a ON p.activity_id = a.activity_id
+    WHERE p.user_id = p_user_id
+        AND p.attendance_status = 'attended'
+        AND a.scheduled_at <= NOW()
+        AND a.status = 'completed'
+)
+SELECT 
+    uaa.activity_id,
+    uaa.title,
+    uaa.scheduled_at,
+    -- Get participants that user hasn't confirmed yet
+    (
+        SELECT jsonb_agg(
+            jsonb_build_object(
+                'user_id', u.user_id,
+                'username', u.username,
+                'first_name', u.first_name,
+                'profile_photo_url', u.main_photo_url
+            )
+        )
+        FROM activity.participants p2
+        JOIN activity.users u ON p2.user_id = u.user_id
+        WHERE p2.activity_id = uaa.activity_id
+            AND p2.attendance_status = 'attended'
+            AND p2.user_id != p_user_id
+            AND NOT EXISTS (
+                SELECT 1 FROM activity.attendance_confirmations
+                WHERE activity_id = uaa.activity_id
+                    AND confirmed_user_id = p2.user_id
+                    AND confirmer_user_id = p_user_id
+            )
+    ) AS participants_to_confirm,
+    COUNT(*) OVER() AS total_count
+FROM user_attended_activities uaa
+WHERE participants_to_confirm IS NOT NULL  -- Only activities with unconfirmed participants
+ORDER BY uaa.scheduled_at DESC
+LIMIT p_limit OFFSET p_offset;
+```
+
+**Error Codes**: Geen (altijd succesvol, kan lege lijst returnen)
+
+---
+
+### 12. Send Invitation(s)
+
+```
+POST /api/v1/participation/activities/{activity_id}/invitations
+```
+
+**Doel**: Organizer/co-organizer stuurt invitations naar users (bulk mogelijk)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity ID
+
+**Request Body**:
+```json
+{
+  "user_ids": [
+    "770e8400-e29b-41d4-a716-446655440000",
+    "880e8400-e29b-41d4-a716-446655440000"
+  ],
+  "message": "Hey! Would love to have you join us for this activity!",  // Optional
+  "expires_in_hours": 72  // Optional, default=72
+}
+```
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "invited_count": 2,
+  "failed_count": 0,
+  "invitations": [
+    {
+      "invitation_id": "aa0e8400-e29b-41d4-a716-446655440000",
+      "user_id": "770e8400-e29b-41d4-a716-446655440000",
+      "status": "pending",
+      "invited_at": "2025-11-13T10:30:00Z",
+      "expires_at": "2025-11-16T10:30:00Z"
+    },
+    {
+      "invitation_id": "bb0e8400-e29b-41d4-a716-446655440000",
+      "user_id": "880e8400-e29b-41d4-a716-446655440000",
+      "status": "pending",
+      "invited_at": "2025-11-13T10:30:00Z",
+      "expires_at": "2025-11-16T10:30:00Z"
+    }
+  ],
+  "failed_invitations": [],
+  "message": "2 invitation(s) sent successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_send_invitations`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_send_invitations(
+    p_activity_id UUID,
+    p_inviting_user_id UUID,
+    p_user_ids UUID[],
+    p_message TEXT DEFAULT NULL,
+    p_expires_in_hours INT DEFAULT 72
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    invited_count INT,
+    failed_count INT,
+    invitations JSONB,  -- Array of successful invitations
+    failed_invitations JSONB,  -- Array of failures with reasons
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat en status = 'published'
+   - Activity privacy = 'invite_only' (alleen voor invite-only activities)
+   - Inviting user is organizer OF co_organizer
+   - Max 50 invitations per call
+
+2. **Loop through user_ids**:
+   - Voor elke user_id:
+     - Check user exists
+     - Check not already invited (no duplicate)
+     - Check not already participant
+     - Check not blocked (both directions)
+     - IF all checks pass:
+       - INSERT INTO activity.activity_invitations (activity_id, user_id, invited_by_user_id, message, expires_at)
+       - expires_at = NOW() + (p_expires_in_hours * INTERVAL '1 hour')
+       - Add to successes array
+     - ELSE: Add to failures array with reason
+
+3. **Return results**:
+   - RETURN success=TRUE, invited_count=successes, failed_count=failures, invitations=json, failed_invitations=json
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `NOT_INVITE_ONLY`: Activity is niet invite-only
+- `NOT_AUTHORIZED`: Inviting user is niet organizer/co-organizer
+- `TOO_MANY_INVITATIONS`: Meer dan 50 invitations in één call
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'NOT_INVITE_ONLY': (400, 'Activity is not invite-only'),
+        'NOT_AUTHORIZED': (403, 'Only organizer or co-organizer can send invitations'),
+        'TOO_MANY_INVITATIONS': (400, 'Maximum 50 invitations per request')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 13. Accept Invitation
+
+```
+POST /api/v1/participation/invitations/{invitation_id}/accept
+```
+
+**Doel**: User accepteert invitation (joins activity direct)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `invitation_id` (UUID, required): Invitation ID
+
+**Request Body**: Leeg
+
+**Response** (200 OK):
+```json
+{
+  "invitation_id": "aa0e8400-e29b-41d4-a716-446655440000",
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "accepted",
+  "participation_status": "registered",
+  "responded_at": "2025-11-13T10:30:00Z",
+  "message": "Invitation accepted and joined activity successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_accept_invitation`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_accept_invitation(
+    p_invitation_id UUID,
+    p_user_id UUID
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    activity_id UUID,
+    participation_status activity.participation_status,
+    waitlist_position INT,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Invitation bestaat
+   - Invitation user_id = p_user_id (eigen invitation)
+   - Invitation status = 'pending'
+   - Invitation NOT expired (expires_at IS NULL OR expires_at > NOW())
+   - Activity scheduled_at > NOW()
+
+2. **Accept invitation**:
+   - UPDATE activity.activity_invitations SET status = 'accepted', responded_at = NOW() WHERE invitation_id = p_invitation_id
+
+3. **Join activity** (roep intern sp_join_activity logic aan):
+   - Check capacity
+   - IF spots available:
+     - INSERT INTO activity.participants (activity_id, user_id, role='member', participation_status='registered')
+     - UPDATE activities SET current_participants_count = current_participants_count + 1
+     - RETURN success=TRUE, participation_status='registered'
+   - ELSE:
+     - INSERT INTO activity.waitlist_entries
+     - RETURN success=TRUE, participation_status='waitlisted', waitlist_position=position
+
+**Error Codes**:
+- `INVITATION_NOT_FOUND`: Invitation niet gevonden
+- `NOT_YOUR_INVITATION`: Invitation is niet voor deze user
+- `ALREADY_RESPONDED`: Invitation al geaccepteerd/declined
+- `INVITATION_EXPIRED`: Invitation is verlopen
+- `ACTIVITY_IN_PAST`: Activity is al geweest
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'INVITATION_NOT_FOUND': (404, 'Invitation not found'),
+        'NOT_YOUR_INVITATION': (403, 'This invitation is not for you'),
+        'ALREADY_RESPONDED': (400, 'Invitation already responded to'),
+        'INVITATION_EXPIRED': (400, 'Invitation has expired'),
+        'ACTIVITY_IN_PAST': (400, 'Activity has already occurred')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 14. Decline Invitation
+
+```
+POST /api/v1/participation/invitations/{invitation_id}/decline
+```
+
+**Doel**: User weigert invitation
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `invitation_id` (UUID, required): Invitation ID
+
+**Request Body**: Leeg
+
+**Response** (200 OK):
+```json
+{
+  "invitation_id": "aa0e8400-e29b-41d4-a716-446655440000",
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "declined",
+  "responded_at": "2025-11-13T10:30:00Z",
+  "message": "Invitation declined"
+}
+```
+
+**Stored Procedure**: `activity.sp_decline_invitation`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_decline_invitation(
+    p_invitation_id UUID,
+    p_user_id UUID
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    activity_id UUID,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Invitation bestaat
+   - Invitation user_id = p_user_id
+   - Invitation status = 'pending'
+
+2. **Decline**:
+   - UPDATE activity.activity_invitations SET status = 'declined', responded_at = NOW() WHERE invitation_id = p_invitation_id
+   - RETURN success=TRUE, activity_id=invitation_activity_id
+
+**Error Codes**:
+- `INVITATION_NOT_FOUND`: Invitation niet gevonden
+- `NOT_YOUR_INVITATION`: Invitation is niet voor deze user
+- `ALREADY_RESPONDED`: Invitation al geaccepteerd/declined
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'INVITATION_NOT_FOUND': (404, 'Invitation not found'),
+        'NOT_YOUR_INVITATION': (403, 'This invitation is not for you'),
+        'ALREADY_RESPONDED': (400, 'Invitation already responded to')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 15. Cancel Invitation
+
+```
+DELETE /api/v1/participation/invitations/{invitation_id}
+```
+
+**Doel**: Organizer/co-organizer cancelt invitation
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `invitation_id` (UUID, required): Invitation ID
+
+**Request Body**: Leeg
+
+**Response** (200 OK):
+```json
+{
+  "invitation_id": "aa0e8400-e29b-41d4-a716-446655440000",
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "cancelled_at": "2025-11-13T10:30:00Z",
+  "message": "Invitation cancelled successfully"
+}
+```
+
+**Stored Procedure**: `activity.sp_cancel_invitation`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_cancel_invitation(
+    p_invitation_id UUID,
+    p_cancelling_user_id UUID
+)
+RETURNS TABLE (
+    success BOOLEAN,
+    activity_id UUID,
+    error_code VARCHAR(50),
+    error_message TEXT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Invitation bestaat
+   - Invitation status = 'pending'
+   - Cancelling user is organizer OF co_organizer OF invited_by_user_id (kan eigen invitation cancelen)
+
+2. **Cancel**:
+   - DELETE FROM activity.activity_invitations WHERE invitation_id = p_invitation_id
+   - RETURN success=TRUE, activity_id=invitation_activity_id
+
+**Error Codes**:
+- `INVITATION_NOT_FOUND`: Invitation niet gevonden
+- `NOT_AUTHORIZED`: User mag deze invitation niet cancelen
+- `ALREADY_RESPONDED`: Invitation al geaccepteerd/declined (kan niet meer cancelen)
+
+**FastAPI Error Mapping**:
+```python
+if not result['success']:
+    error_map = {
+        'INVITATION_NOT_FOUND': (404, 'Invitation not found'),
+        'NOT_AUTHORIZED': (403, 'Not authorized to cancel this invitation'),
+        'ALREADY_RESPONDED': (400, 'Cannot cancel responded invitation')
+    }
+    status_code, message = error_map.get(result['error_code'], (400, result['error_message']))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+### 16. My Received Invitations
+
+```
+GET /api/v1/participation/invitations/received
+```
+
+**Doel**: Lijst van alle invitations die user heeft ontvangen
+
+**Auth**: Access token required
+
+**Query Parameters**:
+- `status` (enum, optional): Filter by status ('pending', 'accepted', 'declined', 'expired')
+- `limit` (int, optional, default=20): Max results (1-100)
+- `offset` (int, optional, default=0): Pagination offset
+
+**Response** (200 OK):
+```json
+{
+  "total_count": 5,
+  "invitations": [
+    {
+      "invitation_id": "aa0e8400-e29b-41d4-a716-446655440000",
+      "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+      "activity_title": "Weekend Hiking Trip",
+      "activity_scheduled_at": "2025-11-20T09:00:00Z",
+      "invited_by_user_id": "770e8400-e29b-41d4-a716-446655440000",
+      "invited_by_username": "outdoor_enthusiast",
+      "status": "pending",
+      "message": "Hey! Would love to have you join us!",
+      "invited_at": "2025-11-13T10:30:00Z",
+      "expires_at": "2025-11-16T10:30:00Z",
+      "responded_at": null
+    }
+  ]
+}
+```
+
+**Stored Procedure**: `activity.sp_get_received_invitations`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_get_received_invitations(
+    p_user_id UUID,
+    p_status activity.invitation_status DEFAULT NULL,
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+    invitation_id UUID,
+    activity_id UUID,
+    activity_title VARCHAR(255),
+    activity_scheduled_at TIMESTAMP WITH TIME ZONE,
+    invited_by_user_id UUID,
+    invited_by_username VARCHAR(100),
+    status activity.invitation_status,
+    message TEXT,
+    invited_at TIMESTAMP WITH TIME ZONE,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    responded_at TIMESTAMP WITH TIME ZONE,
+    total_count BIGINT
+)
+```
+
+**SP Logic**:
+```sql
+SELECT 
+    i.invitation_id,
+    a.activity_id,
+    a.title AS activity_title,
+    a.scheduled_at AS activity_scheduled_at,
+    i.invited_by_user_id,
+    u.username AS invited_by_username,
+    CASE 
+        WHEN i.status = 'pending' AND i.expires_at IS NOT NULL AND i.expires_at <= NOW() 
+        THEN 'expired'::activity.invitation_status
+        ELSE i.status
+    END AS status,
+    i.message,
+    i.invited_at,
+    i.expires_at,
+    i.responded_at,
+    COUNT(*) OVER() AS total_count
+FROM activity.activity_invitations i
+JOIN activity.activities a ON i.activity_id = a.activity_id
+JOIN activity.users u ON i.invited_by_user_id = u.user_id
+WHERE i.user_id = p_user_id
+    AND (p_status IS NULL OR i.status = p_status)
+ORDER BY i.invited_at DESC
+LIMIT p_limit OFFSET p_offset;
+```
+
+**Error Codes**: Geen (altijd succesvol, kan lege lijst returnen)
+
+---
+
+### 17. My Sent Invitations
+
+```
+GET /api/v1/participation/invitations/sent
+```
+
+**Doel**: Lijst van alle invitations die user heeft verstuurd
+
+**Auth**: Access token required
+
+**Query Parameters**:
+- `activity_id` (UUID, optional): Filter by activity
+- `status` (enum, optional): Filter by status ('pending', 'accepted', 'declined', 'expired')
+- `limit` (int, optional, default=20): Max results (1-100)
+- `offset` (int, optional, default=0): Pagination offset
+
+**Response** (200 OK):
+```json
+{
+  "total_count": 12,
+  "invitations": [
+    {
+      "invitation_id": "aa0e8400-e29b-41d4-a716-446655440000",
+      "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+      "activity_title": "Weekend Hiking Trip",
+      "user_id": "880e8400-e29b-41d4-a716-446655440000",
+      "username": "bob_jones",
+      "status": "pending",
+      "invited_at": "2025-11-13T10:30:00Z",
+      "expires_at": "2025-11-16T10:30:00Z",
+      "responded_at": null
+    }
+  ]
+}
+```
+
+**Stored Procedure**: `activity.sp_get_sent_invitations`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_get_sent_invitations(
+    p_inviting_user_id UUID,
+    p_activity_id UUID DEFAULT NULL,
+    p_status activity.invitation_status DEFAULT NULL,
+    p_limit INT DEFAULT 20,
+    p_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+    invitation_id UUID,
+    activity_id UUID,
+    activity_title VARCHAR(255),
+    user_id UUID,
+    username VARCHAR(100),
+    status activity.invitation_status,
+    invited_at TIMESTAMP WITH TIME ZONE,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    responded_at TIMESTAMP WITH TIME ZONE,
+    total_count BIGINT
+)
+```
+
+**SP Logic**:
+```sql
+SELECT 
+    i.invitation_id,
+    a.activity_id,
+    a.title AS activity_title,
+    i.user_id,
+    u.username,
+    CASE 
+        WHEN i.status = 'pending' AND i.expires_at IS NOT NULL AND i.expires_at <= NOW() 
+        THEN 'expired'::activity.invitation_status
+        ELSE i.status
+    END AS status,
+    i.invited_at,
+    i.expires_at,
+    i.responded_at,
+    COUNT(*) OVER() AS total_count
+FROM activity.activity_invitations i
+JOIN activity.activities a ON i.activity_id = a.activity_id
+JOIN activity.users u ON i.user_id = u.user_id
+WHERE i.invited_by_user_id = p_inviting_user_id
+    AND (p_activity_id IS NULL OR i.activity_id = p_activity_id)
+    AND (p_status IS NULL OR i.status = p_status)
+ORDER BY i.invited_at DESC
+LIMIT p_limit OFFSET p_offset;
+```
+
+**Error Codes**: Geen (altijd succesvol, kan lege lijst returnen)
+
+---
+
+### 18. View Waitlist
+
+```
+GET /api/v1/participation/activities/{activity_id}/waitlist
+```
+
+**Doel**: Lijst van alle users op waitlist (organizer/co-organizer only)
+
+**Auth**: Access token required
+
+**Path Parameters**:
+- `activity_id` (UUID, required): Activity ID
+
+**Query Parameters**:
+- `limit` (int, optional, default=50): Max results (1-100)
+- `offset` (int, optional, default=0): Pagination offset
+
+**Response** (200 OK):
+```json
+{
+  "activity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "total_count": 5,
+  "waitlist": [
+    {
+      "waitlist_id": "cc0e8400-e29b-41d4-a716-446655440000",
+      "user_id": "990e8400-e29b-41d4-a716-446655440000",
+      "username": "alice_wonder",
+      "first_name": "Alice",
+      "profile_photo_url": "https://...",
+      "position": 1,
+      "created_at": "2025-11-13T10:30:00Z",
+      "notified_at": null
+    }
+  ]
+}
+```
+
+**Stored Procedure**: `activity.sp_get_waitlist`
+
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_get_waitlist(
+    p_activity_id UUID,
+    p_requesting_user_id UUID,
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+)
+RETURNS TABLE (
+    waitlist_id UUID,
+    user_id UUID,
+    username VARCHAR(100),
+    first_name VARCHAR(100),
+    profile_photo_url VARCHAR(500),
+    position INT,
+    created_at TIMESTAMP WITH TIME ZONE,
+    notified_at TIMESTAMP WITH TIME ZONE,
+    total_count BIGINT
+)
+```
+
+**SP Logic**:
+1. **Validatie checks**:
+   - Activity bestaat
+   - Requesting user is organizer OF co_organizer
+
+2. **Query waitlist**:
+```sql
+SELECT 
+    w.waitlist_id,
+    u.user_id,
+    u.username,
+    u.first_name,
+    u.main_photo_url AS profile_photo_url,
+    w.position,
+    w.created_at,
+    w.notified_at,
+    COUNT(*) OVER() AS total_count
+FROM activity.waitlist_entries w
+JOIN activity.users u ON w.user_id = u.user_id
+WHERE w.activity_id = p_activity_id
+ORDER BY w.position ASC
+LIMIT p_limit OFFSET p_offset;
+```
+
+**Error Codes**:
+- `ACTIVITY_NOT_FOUND`: Activity niet gevonden
+- `NOT_AUTHORIZED`: Requesting user is niet organizer/co-organizer
+
+**FastAPI Error Mapping**:
+```python
+if error:
+    error_map = {
+        'ACTIVITY_NOT_FOUND': (404, 'Activity not found'),
+        'NOT_AUTHORIZED': (403, 'Only organizer or co-organizer can view waitlist')
+    }
+    status_code, message = error_map.get(error_code, (400, error_message))
+    raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+## 🔐 AUTHENTICATIE & TOKEN PAYLOAD
+
+**JWT Token Structuur** (van Auth API):
+```json
+{
+  "sub": "660e8400-e29b-41d4-a716-446655440000",  // user_id
+  "email": "user@example.com",
+  "subscription_level": "premium",  // 'free', 'club', 'premium'
+  "ghost_mode": false,  // Premium feature (niet relevant voor Participation API)
+  "org_id": "770e8400-e29b-41d4-a716-446655440000",  // Optional
+  "exp": 1704067200,
+  "iat": 1704066300,
+  "type": "access"
+}
+```
+
+**Token Extractie in FastAPI**:
+```python
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt
+
+security = HTTPBearer()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return {
+            "user_id": payload["sub"],
+            "email": payload["email"],
+            "subscription_level": payload.get("subscription_level", "free"),
+            "ghost_mode": payload.get("ghost_mode", False),
+            "org_id": payload.get("org_id")
+        }
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+```
+
+**Usage in Endpoints**:
+```python
+@router.post("/activities/{activity_id}/join")
+async def join_activity(
+    activity_id: UUID,
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user["user_id"]
+    subscription_level = current_user["subscription_level"]
+    
+    # Call stored procedure
+    result = await db.execute(
+        "SELECT * FROM activity.sp_join_activity($1, $2, $3)",
+        activity_id, user_id, subscription_level
+    )
+    ...
+```
+
+---
+
+## 📊 RATE LIMITING
+
+**Aanbevolen Rate Limits** (met Redis via slowapi):
+
+| Endpoint | Rate Limit | Reden |
+|----------|-----------|-------|
+| POST /join | 10/minute | Prevent spam joins |
+| DELETE /leave | 10/minute | Prevent spam leaves |
+| POST /invitations | 5/minute | Prevent invitation spam |
+| POST /attendance/confirm | 20/minute | Allow bulk confirmations |
+| POST /attendance | 5/minute | Organizer bulk updates |
+| GET endpoints | 60/minute | Standard read rate |
+
+**Implementatie**:
+```python
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+@router.post("/activities/{activity_id}/join")
+@limiter.limit("10/minute")
+async def join_activity(request: Request, ...):
+    ...
+```
+
+---
+
+## 🧪 TEST SCENARIO'S
+
+### Scenario 1: Complete Join Flow
+```bash
+# 1. Join activity (Premium user - priority access)
+curl -X POST http://localhost:8000/api/v1/participation/activities/{activity_id}/join \
+  -H "Authorization: Bearer <premium_token>"
+
+# 2. Join activity (Free user - waitlisted during priority period)
+curl -X POST http://localhost:8000/api/v1/participation/activities/{activity_id}/join \
+  -H "Authorization: Bearer <free_token>"
+# Expected: 200 with participation_status='waitlisted'
+
+# 3. Premium user leaves → Free user auto-promoted
+curl -X DELETE http://localhost:8000/api/v1/participation/activities/{activity_id}/leave \
+  -H "Authorization: Bearer <premium_token>"
+# Expected: 200 with waitlist_promoted.user_id = <free_user_id>
+```
+
+### Scenario 2: Blocking System
+```bash
+# 1. User A blocks User B
+curl -X POST http://localhost:8000/api/v1/social/blocks \
+  -H "Authorization: Bearer <user_a_token>" \
+  -d '{"blocked_user_id":"<user_b_id>"}'
+
+# 2. User B tries to join User A's activity
+curl -X POST http://localhost:8000/api/v1/participation/activities/{activity_id}/join \
+  -H "Authorization: Bearer <user_b_token>"
+# Expected: 403 'Cannot join this activity'
+
+# 3. User B tries to join User A's XXL activity
+curl -X POST http://localhost:8000/api/v1/participation/activities/{xxl_activity_id}/join \
+  -H "Authorization: Bearer <user_b_token>"
+# Expected: 200 (blocking IGNORED for XXL)
+```
+
+### Scenario 3: Peer Verification
+```bash
+# 1. Mark attendance (organizer)
+curl -X POST http://localhost:8000/api/v1/participation/activities/{activity_id}/attendance \
+  -H "Authorization: Bearer <organizer_token>" \
+  -d '{"attendances":[{"user_id":"<user_a>","status":"attended"},{"user_id":"<user_b>","status":"attended"}]}'
+
+# 2. Get pending verifications
+curl -X GET http://localhost:8000/api/v1/participation/attendance/pending \
+  -H "Authorization: Bearer <user_a_token>"
+# Expected: List with activity containing user_b
+
+# 3. Confirm User B's attendance
+curl -X POST http://localhost:8000/api/v1/participation/attendance/confirm \
+  -H "Authorization: Bearer <user_a_token>" \
+  -d '{"activity_id":"<activity_id>","confirmed_user_id":"<user_b>"}'
+# Expected: 200 with new verification_count
+```
+
+---
+
+## 🚨 KRITISCHE BUSINESS RULES
+
+1. **Blocking systeem**:
+   - Asymmetrisch: A blokkeert B ≠ B blokkeert A
+   - Werkt NIET voor XXL activities (activity_type = 'xxl')
+   - Geblokkeerde users zien elkaar nergens (profiles, activities, participants)
+
+2. **Premium Priority**:
+   - Premium users kunnen joinable_at_free negeren
+   - Free users moeten wachten tot joinable_at_free
+   - Waitlist promotions gebeuren automatisch (FIFO)
+
+3. **Privacy Levels**:
+   - `public`: Iedereen kan joinen (mits geen blocking)
+   - `friends_only`: Alleen accepted friends kunnen joinen
+   - `invite_only`: Alleen invited users kunnen joinen
+
+4. **Attendance Tracking**:
+   - Kan ALLEEN na activity (scheduled_at <= NOW())
+   - ALLEEN organizer/co-organizer kunnen markeren
+   - Peer verification = participants bevestigen elkaar
+   - No-shows tellen mee voor trust score (no_show_count)
+
+5. **Waitlist Auto-Promotion**:
+   - Bij leave/cancel: Next in line (position ASC) wordt automatisch promoted
+   - Positions worden herberekend (decrement all > old_position)
+   - Notification wordt verstuurd naar promoted user (via Notifications API)
+
+6. **Invitation Expiry**:
+   - Invitations kunnen expiry hebben (expires_at)
+   - Expired invitations worden status='expired' in queries
+   - Kan niet accepteren/declineren na expiry
+
+---
+
+## 📦 DEPENDENCIES
+
+**Python Packages** (requirements.txt):
+```
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+asyncpg==0.29.0  # PostgreSQL async driver
+pydantic==2.5.0
+pydantic[email]
+python-jose[cryptography]==3.3.0  # JWT handling
+slowapi==0.1.9  # Rate limiting
+redis==5.0.1  # Rate limiting backend
+python-dotenv==1.0.0
+```
+
+**Database Connection**:
+```python
+import asyncpg
+
+async def get_db_pool():
+    return await asyncpg.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        min_size=10,
+        max_size=50
+    )
+
+# In endpoint
+async with db_pool.acquire() as conn:
+    result = await conn.fetchrow(
+        "SELECT * FROM activity.sp_join_activity($1, $2, $3)",
+        activity_id, user_id, subscription_level
+    )
+```
+
+---
+
+## 🎯 SUCCESS CRITERIA
+
+API is compleet als:
+1. ✅ Alle 18 endpoints geïmplementeerd
+2. ✅ Alle stored procedures correct aangeroepen
+3. ✅ JWT token validatie werkend
+4. ✅ Rate limiting actief op alle write endpoints
+5. ✅ Error handling consistent volgens mapping
+6. ✅ Blocking systeem 100% werkend (met XXL exception)
+7. ✅ Waitlist auto-promotion werkend
+8. ✅ Peer verification systeem werkend
+9. ✅ Premium priority join werkend
+10. ✅ All test scenarios passing
+
+---
+
+**END OF PARTICIPATION API SPECIFICATIONS**
+
+Deze specificaties zijn klaar voor een AI code agent om de volledige Participation API te bouwen. Alle endpoints, stored procedures, business logic, error handling, en edge cases zijn gedocumenteerd.
