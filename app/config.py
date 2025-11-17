@@ -1,8 +1,10 @@
 from pydantic_settings import BaseSettings
-from functools import lru_cache
 
 
 class Settings(BaseSettings):
+    # Environment
+    ENVIRONMENT: str = "development"
+
     # Database
     DB_HOST: str
     DB_PORT: int
@@ -21,12 +23,15 @@ class Settings(BaseSettings):
     # API
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8001
-    ENVIRONMENT: str = "development"
+
+    # API Documentation (Swagger UI / OpenAPI)
+    ENABLE_DOCS: bool = True
+    API_VERSION: str = "1.0.0"
+    PROJECT_NAME: str = "Activity Platform - Participation API"
 
     class Config:
         env_file = ".env"
+        case_sensitive = True
 
 
-@lru_cache()
-def get_settings():
-    return Settings()
+settings = Settings()

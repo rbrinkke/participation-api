@@ -1,9 +1,8 @@
 import asyncpg
 import logging
-from app.config import get_settings
+from app.config import settings
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 # Global pool instance
 db_pool = None
